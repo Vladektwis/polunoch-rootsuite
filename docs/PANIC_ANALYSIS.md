@@ -542,3 +542,52 @@ userspace through this path.  The candidate is closed.
 
 ROOTSTATE NO.  Root is not achieved, and no user-reachable write or read
 primitive exists in this kext on our build.
+
+## 23. DEVICE-CONFIRMED: AIO kevent UAF, far=0x58 (28.11 02:21)
+
+`panic-full-2026-11-28-022145.0002.ips` (pulled from the device):
+
+```
+panic(cpu 2 caller 0xfffffff018f8bc84): Kernel data abort.
+  at pc 0xfffffff018bfff40
+  far:  0x0000000000000058
+  esr:  0x0000000096000006
+  x8:   0x0000000000000000
+  x23:  0x0000000000000058
+Panicked task: pid 1667 RootSuite
+```
+
+This is the exact signature the source project documents for the AIO kevent
+UAF (`AIOsource/lightsword-iphone-16`, VULNS.txt):
+
+> `aio_proc_lock(*(entry+0x40))` -> procp ... **0 -> PANIC FAR=0x58**
+> (the observable reboot in the logs)
+
+So on OUR A14 / 26.2b1 (23C5027f) `filt_aioprocess()` walked a FREED
+`aio_workq_entry`, read `procp` from `entry+0x40`, got NULL, and dereferenced
+it - a null data abort at `far = 0x58`, inside our own process. The UAF path is
+reproduced on this device.
+
+### What it means and what it does not
+
+* CONFIRMED: the freed entry IS processed by the kevent filter - the UAF is
+  real on our build, in our app, from the sandbox.
+* NOT confirmed: control. `procp == 0` means the freed slot was still ZEROED
+  when the filter walked it - the reclaim allocation had not landed yet. Per
+  the source project, that is the difference between a panic and a HIT:
+  "Waiting for the reclaim I/O to actually complete means the slot is occupied
+  by our entry, so the filter copies our bytes out instead of panicking."
+
+### Next gate
+
+Get a controlled object into `aio_workq_zonep` (224 B) so that the freed slot
+is occupied when the filter walks it, i.e. `entry+0x40` holds a valid procp and
+`entry+0x10/+0x18` hold controlled link pointers - then `TAILQ_REMOVE` becomes
+a write through our own data and `aio_entry_unref(+0x2C)` becomes a double
+free. The current module already issues 8 reclaim requests on the same thread
+right after the free; the next iteration must make one of them land BEFORE the
+filter walk (more reclaim requests, tighter free->reclaim spacing, and CPU
+pinning as in the source PoC).
+
+ROOTSTATE NO. Root is not achieved; this is a confirmed kernel UAF, not a
+primitive.
