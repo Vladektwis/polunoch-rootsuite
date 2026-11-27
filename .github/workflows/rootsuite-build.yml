@@ -1,0 +1,37 @@
+name: rootsuite-build
+# macOS minutes are billed 10x, so the push trigger is limited to real code
+# changes.  No concurrency group (a new dispatch used to cancel a running build).
+on:
+  push:
+    branches: [reclaim-20637]
+    paths:
+      - 'Sources/**'
+      - 'scripts/**'
+      - 'RootSuite/**'
+      - '.github/workflows/rootsuite-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: |
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-path
+          clang --version | head -1
+      - name: build
+        run: chmod +x scripts/build.sh && scripts/build.sh
+      - name: verify
+        run: |
+          ls -la out/
+          file out/Payload/RootSuite.app/RootSuite
+          otool -hv out/Payload/RootSuite.app/RootSuite || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RootSuite-ipa
+          path: out/RootSuite.ipa
+          if-no-files-found: error
+          retention-days: 14
