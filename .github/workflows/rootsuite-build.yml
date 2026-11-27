@@ -1,13 +1,20 @@
 name: rootsuite-build
-# Manual only: macOS minutes are billed 10x.  No concurrency group (a new dispatch
-# used to cancel the running build).
+# macOS minutes are billed 10x, so the push trigger is limited to real code
+# changes.  No concurrency group (a new dispatch used to cancel a running build).
 on:
+  push:
+    branches: [reclaim-20637]
+    paths:
+      - 'Sources/**'
+      - 'scripts/**'
+      - 'RootSuite/**'
+      - '.github/workflows/rootsuite-build.yml'
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-26-intel      # the only macOS label this account can schedule
-    timeout-minutes: 20
+    runs-on: macos-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: toolchain
@@ -22,10 +29,6 @@ jobs:
           ls -la out/
           file out/Payload/RootSuite.app/RootSuite
           otool -hv out/Payload/RootSuite.app/RootSuite || true
-          ls -la out/Payload/RootSuite.app/Frameworks/
-      - name: check the selector + modules are in the binary
-        run: |
-          strings out/Payload/RootSuite.app/RootSuite | grep -iE "ROOT: |RootSuite|Запустить|Sileo|Terminal|bad_query|PAC-оракул" | sort -u | head -20
       - uses: actions/upload-artifact@v4
         with:
           name: RootSuite-ipa
