@@ -1502,10 +1502,10 @@ NSString *ModAioKevent(void) {
     AveLog(@"[aio20637b12] === AIO kevent UAF: B1 trigger + B2 kevent read ===");
 
     // re-print whatever the crashed run left behind
-    NSString *prev = [NSString stringWithContentsOfFile:rs_aio_logpath()
-                                               encoding:NSUTF8StringEncoding error:nil];
-    NSString *prevStr = (NSString *)prev;
-    if (prevStr.length > 4) {
+    NSData *pdata = [NSData dataWithContentsOfFile:rs_aio_logpath()];
+    NSString *prevStr = pdata ? [[[NSString alloc] initWithData:pdata
+                                        encoding:NSUTF8StringEncoding] autorelease] : nil;
+    if (prevStr && prevStr.length > 4) {
         AveLog(@"[aio20637b12] === PREVIOUS RUN (survived the reboot) ===");
         NSArray *pl = [prevStr componentsSeparatedByString:@"\n"];
         for (NSUInteger i = 0; i < pl.count && i < 80; i++)
