@@ -1509,7 +1509,7 @@ NSString *ModAioKevent(void) {
         AveLog(@"[aio20637b12] === PREVIOUS RUN (survived the reboot) ===");
         NSArray *pl = [prevStr componentsSeparatedByString:@"\n"];
         for (NSUInteger i = 0; i < pl.count && i < 80; i++)
-            if (pl[i].length) AveLog(S(@"[prev] %@", pl[i]));
+            if ([(NSString *)pl[i] length]) AveLog(S(@"[prev] %@", pl[i]));
         AveLog(@"[aio20637b12] === END PREVIOUS RUN ===");
     }
     rs_aio_dlog(S(@"=== NEW RUN pid=%d ===", getpid()));
