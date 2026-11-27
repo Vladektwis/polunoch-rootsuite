@@ -2590,13 +2590,13 @@ NSString *ModAioRace(void) {
             int queued = 0;
             for (int i = 0; i < N; i++) {
                 rbuf[i] = malloc(2048);
-                memset(&rs_aio_cb[i], 0, sizeof cb[i]);
+                memset(&cb[i], 0, sizeof cb[i]);
                 cb[i].aio_fildes = wfd;
                 cb[i].aio_buf = rbuf[i];
                 cb[i].aio_nbytes = 2048;
                 cb[i].aio_offset = (off_t)(i * 2048);
                 cb[i].aio_sigevent.sigev_notify = SIGEV_NONE;
-                if (aio_read(&rs_aio_cb[i]) == 0) queued++;
+                if (aio_read(&cb[i]) == 0) queued++;
                 else AveLog(S(@"[aio] round %d: aio_read %d -> %d (not queued)", round, i, errno));
             }
             // tear the descriptor down under the in-flight requests
@@ -2607,9 +2607,9 @@ NSString *ModAioRace(void) {
             // every later aio_read fails EAGAIN, which is exactly what happened
             // on the first device run (35 = EAGAIN on all 16).
             const struct aiocb *waitList[N];
-            for (int i = 0; i < N; i++) waitList[i] = &rs_aio_cb[i];
+            for (int i = 0; i < N; i++) waitList[i] = &cb[i];
             aio_suspend((void *)waitList, N, NULL);
-            for (int i = 0; i < N; i++) { ssize_t r = aio_return((struct aiocb *)&rs_aio_cb[i]); (void)r; }
+            for (int i = 0; i < N; i++) { ssize_t r = aio_return((struct aiocb *)&cb[i]); (void)r; }
             // let the completions/teardown run
             usleep(30000);
             for (int i = 0; i < N; i++) {
