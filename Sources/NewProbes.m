@@ -1536,7 +1536,14 @@ NSString *ModAioKevent(void) {
                             rs_aio_rcb[i].aio_nbytes = RECL_NB;
                             rs_aio_rcb[i].aio_lio_opcode = LIO_READ;
                             rs_aio_rcb[i].aio_sigevent.sigev_notify = SIGEV_NONE;
-                            if (aio_read(&rs_aio_rcb[i]) == 0) issued++;
+                            errno = 0;
+                            int rr = aio_read(&rs_aio_rcb[i]);
+                            if (rr == 0) {
+                                issued++;
+                            } else if (i == 0) {
+                                AveLog(S(@"[aio20637b12] RECLAIM ISSUE FAILED errno=%d (%s)",
+                                         errno, strerror(errno)));
+                            }
                         }
                         done = 1;
                         return;
