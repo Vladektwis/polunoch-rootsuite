@@ -1504,9 +1504,10 @@ NSString *ModAioKevent(void) {
     // re-print whatever the crashed run left behind
     NSString *prev = [NSString stringWithContentsOfFile:rs_aio_logpath()
                                                encoding:NSUTF8StringEncoding error:nil];
-    if (prev.length > 4) {
+    NSString *prevStr = (NSString *)prev;
+    if (prevStr.length > 4) {
         AveLog(@"[aio20637b12] === PREVIOUS RUN (survived the reboot) ===");
-        NSArray *pl = [prev componentsSeparatedByString:@"\n"];
+        NSArray *pl = [prevStr componentsSeparatedByString:@"\n"];
         for (NSUInteger i = 0; i < pl.count && i < 80; i++)
             if (pl[i].length) AveLog(S(@"[prev] %@", pl[i]));
         AveLog(@"[aio20637b12] === END PREVIOUS RUN ===");
