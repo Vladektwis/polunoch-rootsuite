@@ -607,6 +607,34 @@ So **`aio_return()` is the free**. That is the call our racer block makes
 immediately after `aio_error()` reports completion.
 
 ### Why the knote then dangles
+### CORRECTION to section 24 (added after the next device run)
+
+Section 24 claimed `far: 0x58` equals `offsetof(struct proc, p_mlock)`. **That
+was wrong and is retracted.** Computing the layout from
+`bsd/sys/proc_internal.h` gives:
+
+```
++0x00 union{ LIST_ENTRY(proc) p_list; }   16 bytes
++0x10 struct proc *p_pptr                  8
++0x18 proc_ro_t p_proc_ro                  8
++0x20 p_ppid  p_pgrpid  p_uid  p_gid  p_ruid  p_rgid  p_svuid  p_svgid  p_sessionid
++0x48 uint64_t p_puniqueid
++0x50 lck_mtx_t p_mlock          <-- 0x50, NOT 0x58
+```
+
+`p_aio_total_count` (line 333) and `p_aio_doneq` (line 413) sit far deeper in
+the struct, so neither can be the 0x58 access either.
+
+What IS verified: the panic dump has `x21 = 0x50`, which is exactly
+`&procp->p_mlock` when `procp == 0`, and `far = x23 = 0x58` is `+8` past it -
+i.e. the mutex word inside `_lck_mtx_t_`. That reading is *consistent* with
+`aio_proc_lock(p)` -> `lck_mtx_lock(&p->p_mlock)` dereferencing the lock word
+of a NULL `procp`, but it is NOT verified: the definition of `struct
+__lck_mtx_t__` is not in the shipped headers, and the faulting PC
+`0xfffffff018bfff40` has a corrupt `lr`, so it cannot be symbolized without
+disassembling `filt_aioprocess` in the device kernelcache. Treat the offset
+mapping as an open item, not a result.
+
 
 `filt_aioattach` (line 2496) stores the entry pointer RAW:
 
@@ -686,3 +714,85 @@ the freed slot, and logs the userspace `aiocb` addresses so `kevent.ident`
 (captured from `entryp->uaiocbp` at `aio_register_kevent`, line 1523) can be
 decoded. Deterministic, indexed control of the slot is the precondition for
 anything beyond a read.
+
+
+## 25. TWO DECISIVE RESULTS FROM THE SECOND DEVICE RUN (self-identifying build)
+
+### 25.1 The freed slot IS index-selectable
+
+With each of the 8 reclaim requests given a distinct `aio_nbytes`
+(0x200, 0x240, ... 0x3c0), `ext[1]` became a tag naming the winner:
+
+```
+victim_aiocb=0x105105ad8 reclaim_aiocb0=0x105105b28   -> sizeof(struct aiocb)=0x50
+ident=0x105105ad8                                     -> the VICTIM's aiocb (knote kn_id)
+ext1 = 0x340 -> reclaim[5]      ext1 = 0x2c0 -> reclaim[3]
+ext1 = 0x300 -> reclaim[4]      ext1 = 0x240 -> reclaim[1]
+ext1 = 0x200 -> reclaim[0]
+```
+
+`ident` is the victim's `aiocb` address, NOT `entry+0x48` of the occupant, so
+`kev.ident` is the knote's `kn_id` captured at `aio_register_kevent` and says
+nothing about the reallocated slot. Only `ext[0]`/`ext[1]` come from the entry.
+
+The winner varies across rounds but is dominated by `reclaim[5]`. So the
+reclaim is **not** a blind spray - which entry lands in the freed slot is
+steerable by the order and spacing of the `aio_read`s.
+
+### 25.2 The write path is CLOSED - proof
+
+`filt_aioprocess` needs controlled data at `entry+0x10/+0x18`
+(`aio_proc_link.tqe_next/tqe_prev`) for `TAILQ_REMOVE` to become
+`*(entry+0x18) = *(entry+0x10)`. Two independent facts rule that out:
+
+1. **The zone is dedicated.** `KALLOC_TYPE_DEFINE(aio_workq_zonep,
+   aio_workq_entry, KT_DEFAULT)` expands (`osfmk/kern/kalloc.h:1598`) to a
+   `struct kalloc_type_view` with `.kt_zv.zv_name = "site.aio_workq_entry"` and
+   `.kt_size = sizeof(type)` - one zone per type definition. `KT_DEFAULT`
+   (kalloc.h:242) only selects *accounting* ("shared accounting unless toggled
+   with KT_OPTIONS_ACCT"), it does not merge zones. `aio_workq_zonep` therefore
+   receives only `aio_workq_entry` allocations, so the cross-type reclaim the
+   upstream project lists as its open gate (A0) is not reachable.
+2. **The link fields are kernel-owned.** `aio_create_queue_entry` copies in only
+   `procp`, `uaiocbp`, `flags`, `refcount`, and the whole `aiocb` (at +0x50).
+   `aio_proc_link` is written by `TAILQ_INSERT_TAIL` in
+   `aio_try_proc_insert_active_locked`, and `aio_proc_remove_done_locked`
+   (kern_aio.c:474) then nulls `tqe_prev`. Nothing userspace supplies ever
+   reaches +0x10/+0x18.
+
+The full `aio_workq_entry` layout, verified against the source:
+
+```
++0x00 aio_workq_link (tqe_next, tqe_prev)
++0x10 aio_proc_link  (tqe_next, tqe_prev)   <- what TAILQ_REMOVE walks
++0x20 returnval    -> kev.ext[1]
++0x28 errorval     -> kev.ext[0]
++0x2C aio_refcount <- aio_entry_unref
++0x30 flags        +0x34 lio_pending   +0x38 lio_leader
++0x40 procp        <- aio_proc_lock (NULL -> far=0x58 family)
++0x48 uaiocbp      +0x50 aiocb (copy of the user aiocb)
+```
+
+**Conclusion: the AIO kevent UAF yields a controlled stale READ of our own
+`aio_nbytes`, and nothing more. It cannot be escalated to a write, and it
+cannot reach root.** This is the same conclusion the upstream project reached
+("запись здесь НЕ бесплатна"), now established here from the XNU source rather
+than inferred.
+
+### 25.3 What remains open
+
+* `errorval` (+0x28) is an `errno_t` - bounded by the errno range, so it is not
+  a pointer-leak channel either.
+* A dangling `filt_aioevent` (kern_aio.c:2518) also reads `entryp->flags` with
+  no reference taken; it is a second UAF read, but `flags` is not controllable.
+* CVE-2026-20626's fix (`lck_mtx_lock(&setuid_lock)` around
+  `kauth_cred_proc_update`) is present in xnu-12377.61.12 and absent from
+  12377.41.6. Our device is xnu-12377.60.50.502.2, i.e. on the unpatched side -
+  but from a clean uid-501 process all three of ruid/euid/svuid are 501, so the
+  kernel will not accept 0 and the race alone cannot produce root. Needs RE
+  with no public PoC.
+* CVE-2026-20687 keeps the more promising shape: the freed object is a
+  `kalloc(0x440)`, and `kalloc` buckets ARE shared size classes, so a
+  cross-type reclaim is possible there (the module already sprays controlled
+  bytes via mach-port OOL data). The missing piece is register-level evidence
+  that the spray lands in the freed slot.
