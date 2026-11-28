@@ -591,3 +591,98 @@ pinning as in the source PoC).
 
 ROOTSTATE NO. Root is not achieved; this is a confirmed kernel UAF, not a
 primitive.
+
+## 24. SOURCE-VERIFIED MECHANISM + 40/40 DEVICE HIT (28.11, post-fix)
+
+### The refcount chain that frees the entry (xnu-12377.61.12, bsd/kern/kern_aio.c)
+
+| line | site | refcount after |
+|------|------|----------------|
+| 1878 | `os_ref_init(&entryp->aio_refcount, &aio_refgrp)` in `aio_create_queue_entry`, comment *"consumed in aio_return or _aio_exit"* | 1 |
+| 1472 | `aio_entry_ref(entryp)` in `aio_try_enqueue_work_locked`, comment *"consumed in do_aio_completion_and_unlock"* | 2 |
+| 2173 | `aio_entry_unref(entryp)` at the end of `do_aio_completion_and_unlock` | 1 |
+| 867 | `aio_entry_unref(entryp)` in `aio_return` | **0 -> `aio_free_request` -> `zfree(aio_workq_zonep, entryp)`** |
+
+So **`aio_return()` is the free**. That is the call our racer block makes
+immediately after `aio_error()` reports completion.
+
+### Why the knote then dangles
+
+`filt_aioattach` (line 2496) stores the entry pointer RAW:
+
+```c
+knote_kn_hook_set_raw(kn, (void *)entryp);   /* no aio_entry_ref() taken */
+```
+
+`aio_register_kevent` (line 1534) only calls `kevent_register`; it takes no
+reference on the entry either. The knote therefore holds an unreferenced
+pointer to a zone allocation whose lifetime is owned by `aio_return`.
+
+`filt_aioprocess` (lines 2551-2579) is `EVFILT_AIO`'s `f_process` hook, so it
+runs **inside our own `kevent64()` call**, and dereferences that raw pointer:
+
+```c
+entryp = knote_kn_hook_get_raw(kn);   /* line 2557 - dangling */
+assert(entryp);
+p = entryp->procp;                     /* line 2559 - entry+0x40 */
+lck_mtx_lock(&aio_klist_lock);
+if (kn->kn_fflags) {
+        kn->kn_ext[0] = entryp->errorval;    /* entry+0x28 */
+        kn->kn_ext[1] = entryp->returnval;   /* entry+0x20  <-- freed memory */
+        knote_fill_kevent(kn, kev, 0);        /* delivered to userspace */
+        knote_kn_hook_set_raw(kn, NULL);
+        aio_proc_lock(p);                     /* line 2569 */
+        aio_proc_remove_done_locked(p, entryp);   /* TAILQ_REMOVE, entry+0x10/+0x18 */
+        aio_proc_unlock(p);
+        aio_entry_unref(entryp);              /* entry+0x2C - refcount of freed slot */
+        res = FILTER_ACTIVE;
+}
+```
+
+### Both observed outcomes now follow from the source, exactly
+
+**Panic, 28.11 02:21 (`issued=0`).** The block-capture bug meant the reclaim was
+never issued, so the freed slot was not reallocated. `entryp->procp` read 0,
+`aio_proc_lock(p)` became `lck_mtx_lock(&p->p_mlock)` with `p == NULL`, i.e. a
+dereference of `0x58` - which is `p_mlock`'s offset inside `struct proc`.
+That is literally `far: 0x0000000000000058` in the .ips, with `x8 = 0` and
+`x23 = 0x58`. Matches to the byte.
+
+**Hit, post-fix (`issued=8`).** The eight reclaim `aio_read`s reallocate
+`aio_workq_zonep` elements; one lands in the freed slot with a valid `procp`,
+so `aio_proc_lock` succeeds and `filt_aioprocess` reads `returnval` out of the
+RECLAIMED memory. Our `RECL_NB` is 0x200 and the kevent reported
+`ext1=0x200` on 40/40 rounds - the reclaimed entry's `returnval`, not the
+victim's (the victim transfers `VICTIM_NB` = 0x10000 and reported exactly
+0x10000 in the pre-fix run, when no reclaim was issued).
+
+That contrast is the proof: the only variable that changed between
+`ext1=0x10000` and `ext1=0x200` is whether the reclaim requests were issued.
+
+### What is established and what is not
+
+ESTABLISHED (device + source):
+* The `aio_workq_entry` is freed while a kqueue knote still points at it.
+* The freed slot is reallocated by our own controlled `aio_read` requests.
+* `filt_aioprocess` reads `procp`(+0x40), `errorval`(+0x28), `returnval`(+0x20)
+  and the `aio_proc_link`(+0x10/+0x18) used by `TAILQ_REMOVE`, plus
+  `aio_refcount`(+0x2C), out of that reallocated memory - inside our thread,
+  from the sandbox, with no crash.
+
+NOT established:
+* Control of the reclaimed entry's `aio_proc_link`, which is what would turn
+  `aio_proc_remove_done_locked`'s `TAILQ_REMOVE` (`*(entryp+0x10) = entryp+0x18`)
+  into a write primitive. The current reclaim requests only reach the entry
+  through the fields `aio_create_queue_entry` copies in (`procp`, `uaiocbp`,
+  `flags`, the whole `aiocb`, refcount=1) - none of which are the link fields.
+* Root. ROOTSTATE NO. A stale read is a signal, not a primitive.
+
+### The open gate
+
+Make the reclaimed entry's `aio_proc_link` land where we choose. The next
+build tags each of the eight reclaim requests with a distinct `aio_nbytes`
+(0x200, 0x240, ... 0x3c0) so that `ext[1]` names WHICH reclaim allocation won
+the freed slot, and logs the userspace `aiocb` addresses so `kevent.ident`
+(captured from `entryp->uaiocbp` at `aio_register_kevent`, line 1523) can be
+decoded. Deterministic, indexed control of the slot is the precondition for
+anything beyond a read.
